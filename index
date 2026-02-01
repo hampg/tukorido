@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tüköridő óra</title>
+  <style>
+    :root{
+      --bg:#0b0f14;
+      --fg:rgba(255,255,255,0.92);
+      --muted:rgba(255,255,255,0.65);
+      --line:rgba(255,255,255,0.14);
+      --chip-bg:rgba(255,255,255,0.08);
+      --chip-border:rgba(255,255,255,0.18);
+      --countdown-bg:rgba(255,255,255,0.92);
+      --countdown-fg:rgba(0,0,0,0.86);
+    }
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+    .stage{position:relative;width:100vw;height:100vh;display:grid;place-items:center;}
+    canvas{width:min(92vmin,900px);height:min(92vmin,900px);display:block;}
+    .hud{position:absolute;left:18px;top:18px;display:flex;flex-direction:column;gap:10px;z-index:10}
+    .chip{
+      display:inline-flex;align-items:center;gap:10px;
+      padding:10px 12px;border-radius:999px;
+      background:var(--chip-bg);border:1px solid var(--chip-border);
+      backdrop-filter: blur(6px);
+      font-variant-numeric: tabular-nums;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size:14px;
+      color:var(--fg);
+      max-width: min(86vw, 420px);
+      white-space:nowrap;
+    }
+    .chip .label{color:var(--muted);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:12px}
+    .countdown{
+      background:var(--countdown-bg);
+      color:var(--countdown-fg);
+      border:1px solid rgba(0,0,0,0.10);
+    }
+
+    /* Fullscreen digital mirror mode */
+    .digital-mode{
+      position:absolute;inset:0;display:none;place-items:center;z-index:5;
+      background:transparent;
+    }
+    .digital-mode .digits{
+      font-variant-numeric: tabular-nums;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-weight:800;
+      font-size:min(18vmin,140px);
+      letter-spacing:0.06em;
+      line-height:1;
+      padding:0.25em 0.35em;
+      border-radius:24px;
+      border:1px solid var(--line);
+      background:rgba(255,255,255,0.06);
+      text-align:center;
+      user-select:none;
+    }
+    .digital-mode .sub{
+      margin-top:14px;
+      font-size:14px;
+      color:var(--muted);
+      text-align:center;
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      user-select:none;
+    }
+
+    /* Invert colors during any mirror window */
+    body.invert{
+      background:#ffffff;
+      color:rgba(0,0,0,0.9);
+    }
+    body.invert .chip{
+      background:rgba(0,0,0,0.06);
+      border:1px solid rgba(0,0,0,0.14);
+      color:rgba(0,0,0,0.9);
+    }
+    body.invert .chip .label{color:rgba(0,0,0,0.55);}
+    body.invert .countdown{
+      background:rgba(0,0,0,0.92);
+      color:rgba(255,255,255,0.92);
+      border:1px solid rgba(255,255,255,0.20);
+    }
+    body.invert .digital-mode .digits{
+      background:rgba(0,0,0,0.06);
+      border:1px solid rgba(0,0,0,0.14);
+    }
+    body.invert .digital-mode .sub{color:rgba(0,0,0,0.6);}
+
+    /* When in digital mirror, hide canvas */
+    body.digital-only canvas{display:none;}
+    body.digital-only .digital-mode{display:grid;}
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <div class="hud">
+      <div class="chip"><span class="label">idő</span><span id="digitalNow">--:--:--</span></div>
+      <div class="chip countdown"><span class="label">köv. tükör</span><span id="countdown">--:--</span><span class="label" id="nextType">—</span></div>
+    </div>
+
+    <canvas id="clock" width="900" height="900" aria-label="Analóg óra"></canvas>
+
+    <div class="digital-mode" aria-hidden="true">
+      <div>
+        <div class="digits" id="mirrorDigits">--:--</div>
+        <div class="sub" id="mirrorSub">tüköridő</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // =========================
+  // CONFIG
+  // =========================
+  const CONFIG = {
+    // Soft: analóg V-szimmetria a 12–6 tengelyre, ±10s ablak
+    softWindowSec: 10,
+
+    // Digitális tüköridők: HH:MM ahol MM = reverse(HH) (24 órás), egész percre
+    // (00:00-t nem ide tesszük, mert HARD)
+    enableDigitalMirror: true,
+
+    // Fullscreen digitális mód csak digitális tükörnél legyen
+    // (analóg soft/hard tükörnél maradjon az óralap + invert)
+    digitalOnlyOn: "digital", // "digital" | "all_mirrors"
+  };
+
+  // =========================
+  // DOM
+  // =========================
+  const canvas = document.getElementById("clock");
+  const ctx = canvas.getContext("2d");
+
+  const elDigitalNow = document.getElementById("digitalNow");
+  const elCountdown = document.getElementById("countdown");
+  const elNextType = document.getElementById("nextType");
+
+  const elMirrorDigits = document.getElementById("mirrorDigits");
+  const elMirrorSub = document.getElementById("mirrorSub");
+
+  // =========================
+  // Helpers
+  // =========================
+  const deg2rad = (d) => (d * Math.PI) / 180;
+  const normDeg = (d) => { d = d % 360; if (d < 0) d += 360; return d; };
+
+  const fmt2 = (n) => String(n).padStart(2, "0");
+  const fmtTime = (date) => `${fmt2(date.getHours())}:${fmt2(date.getMinutes())}:${fmt2(date.getSeconds())}`;
+  const fmtHM = (h, m) => `${fmt2(h)}:${fmt2(m)}`;
+
+  // seconds in day (float)
+  function secondsOfDay(date) {
+    return date.getHours()*3600 + date.getMinutes()*60 + date.getSeconds() + date.getMilliseconds()/1000;
+  }
+
+  // Time -> hand angles (0° at 12 o'clock, clockwise)
+  const handAngles = (date) => {
+    const h24 = date.getHours();
+    const h = h24 % 12;
+    const m = date.getMinutes();
+    const s = date.getSeconds();
+    const ms = date.getMilliseconds();
+
+    const sec = s + ms / 1000;
+    const min = m + sec / 60;
+    const hour = h + min / 60;
+
+    const thetaMin = normDeg(min * 6);
+    const thetaHour = normDeg(hour * 30);
+    const thetaSec = normDeg(sec * 6);
+
+    return { thetaHour, thetaMin, thetaSec, h24, h, m, s, ms };
+  };
+
+  // =========================
+  // HARD MIRROR (12 órás számlapon)
+  // minutes==0 && hour∈{0,3,6,9}
+  // =========================
+  const isHardMirrorMinute = ({h, m}) => (m === 0) && (h === 0 || h === 3 || h === 6 || h === 9);
+
+  // =========================
+  // DIGITAL MIRROR (24 órás, egész perc)
+  // HH:MM ahol MM = reverse(HH) és 0..59
+  // =========================
+  function isDigitalMirrorMinute(h24, m) {
+    const HH = fmt2(h24);
+    const rev = HH.split("").reverse().join("");
+    const mm = Number(rev);
+    return mm >= 0 && mm <= 59 && mm === m && !(h24 === 0 && m === 0);
+  }
+
+  function buildDailyDigitalMirrorEvents() {
+    const events = [];
+    for (let h24 = 0; h24 < 24; h24++) {
+      const HH = fmt2(h24);
+      const mm = Number(HH.split("").reverse().join(""));
+      if (mm >= 0 && mm <= 59) {
+        if (h24 === 0 && mm === 0) continue; // 00:00 hard
+        events.push({ type: "digital", h24, m: mm, sec: 0 });
+      }
+    }
+    // Sort by time in day
+    events.sort((a,b) => (a.h24*3600+a.m*60+a.sec) - (b.h24*3600+b.m*60+b.sec));
+    return events;
+  }
+
+  const DIGITAL_EVENTS = CONFIG.enableDigitalMirror ? buildDailyDigitalMirrorEvents() : [];
+
+  // =========================
+  // SOFT: analóg V-szimmetria a 12–6 tengelyre
+  // Feltétel: 30h + 6.5m ≡ 0 (mod 360)
+  // m = (360k - 30h) / 6.5  , m∈[0,60)
+  // =========================
+  function solveSoftMinuteForHour(h12) {
+    for (let k = -1; k <= 2; k++) {
+      const m = (360*k - 30*h12) / 6.5;
+      if (m >= 0 && m < 60) return { m, k };
+    }
+    return null;
+  }
+
+  function buildDailySoftAxisVEvents() {
+    const events = [];
+    for (let h24 = 0; h24 < 24; h24++) {
+      const h12 = h24 % 12;
+      const sol = solveSoftMinuteForHour(h12);
+      if (!sol) continue;
+
+      const mFloat = sol.m;
+      const m = Math.floor(mFloat);
+      const sec = (mFloat - m) * 60; // float sec
+      events.push({ type: "soft_axis_v", h24, m, sec });
+    }
+    events.sort((a,b) => (a.h24*3600+a.m*60+a.sec) - (b.h24*3600+b.m*60+b.sec));
+    return events;
+  }
+
+  const SOFT_EVENTS = buildDailySoftAxisVEvents();
+
+  // =========================
+  // Unified event list for countdown (hard+soft+digital)
+  // Hard mirror are minute-long states but for countdown we treat them as a start moment at HH:00:00
+  // =========================
+  function buildDailyHardStartEvents() {
+    const events = [];
+    for (let h24 = 0; h24 < 24; h24++) {
+      const h12 = h24 % 12;
+      if (h12 === 0 || h12 === 3 || h12 === 6 || h12 === 9) {
+        events.push({ type: "hard", h24, m: 0, sec: 0 });
+      }
+    }
+    events.sort((a,b) => (a.h24*3600+a.m*60+a.sec) - (b.h24*3600+b.m*60+b.sec));
+    return events;
+  }
+
+  const HARD_START_EVENTS = buildDailyHardStartEvents();
+
+  const ALL_EVENTS = [
+    ...HARD_START_EVENTS,
+    ...SOFT_EVENTS,
+    ...DIGITAL_EVENTS,
+  ].sort((a,b) => (a.h24*3600+a.m*60+a.sec) - (b.h24*3600+b.m*60+b.sec));
+
+  function evSecOfDay(ev) {
+    return ev.h24*3600 + ev.m*60 + ev.sec;
+  }
+
+  function findNextEvent(nowSec) {
+    // find first event strictly after nowSec; else wrap to tomorrow's first
+    for (const ev of ALL_EVENTS) {
+      const t = evSecOfDay(ev);
+      if (t > nowSec) return { ev, deltaSec: t - nowSec };
+    }
+    // wrap
+    const first = ALL_EVENTS[0];
+    return { ev: first, deltaSec: (86400 - nowSec) + evSecOfDay(first) };
+  }
+
+  function findClosestSoftAxisV(nowSec) {
+    let best = null;
+    for (const ev of SOFT_EVENTS) {
+      const t = evSecOfDay(ev);
+      let d = Math.abs(nowSec - t);
+      d = Math.min(d, 86400 - d); // wrap
+      if (!best || d < best.deltaSec) best = { ev, deltaSec: d, evSec: t };
+    }
+    return best;
+  }
+
+  // =========================
+  // Mirror evaluation (what is happening NOW?)
+  // =========================
+  function evaluateNow(date, angles) {
+    const h12 = angles.h;
+    const m = angles.m;
+    const h24 = angles.h24;
+
+    // 1) HARD state: full minute at HH:00
+    const hard = isHardMirrorMinute({h: h12, m});
+    if (hard) return { mirror: true, kind: "hard", label: "HARD", showDigitalOnly: (CONFIG.digitalOnlyOn==="all_mirrors") };
+
+    // 2) DIGITAL mirror: full minute at HH:MM
+    if (CONFIG.enableDigitalMirror && isDigitalMirrorMinute(h24, m)) {
+      return { mirror: true, kind: "digital", label: "DIGITAL", showDigitalOnly: true };
+    }
+
+    // 3) SOFT axis-V: within ±window seconds of the exact event time
+    const nowSec = secondsOfDay(date);
+    const closest = findClosestSoftAxisV(nowSec);
+    if (closest && closest.deltaSec <= CONFIG.softWindowSec) {
+      return { mirror: true, kind: "soft", label: "SOFT", showDigitalOnly: (CONFIG.digitalOnlyOn==="all_mirrors") , softDelta: closest.deltaSec, softEvent: closest.ev };
+    }
+
+    return { mirror: false, kind: "none", label: "—", showDigitalOnly: false };
+  }
+
+  // =========================
+  // Drawing (analog)
+  // =========================
+  const drawClock = (angles) => {
+    const W = canvas.width, H = canvas.height;
+    const cx = W / 2, cy = H / 2;
+    const R = Math.min(W, H) * 0.42;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.save();
+    ctx.translate(cx, cy);
+
+    // Outer circle
+    ctx.beginPath();
+    ctx.arc(0, 0, R * 1.08, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.03)";
+    ctx.fill();
+    ctx.lineWidth = R * 0.02;
+    ctx.strokeStyle = "rgba(255,255,255,0.10)";
+    ctx.stroke();
+
+    // Ticks
+    for (let i = 0; i < 60; i++) {
+      const a = deg2rad(i * 6 - 90);
+      const isHour = i % 5 === 0;
+      const r1 = R * (isHour ? 0.88 : 0.92);
+      const r2 = R * 0.98;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * r1, Math.sin(a) * r1);
+      ctx.lineTo(Math.cos(a) * r2, Math.sin(a) * r2);
+      ctx.lineWidth = isHour ? R * 0.018 : R * 0.008;
+      ctx.strokeStyle = isHour ? "rgba(255,255,255,0.22)" : "rgba(255,255,255,0.10)";
+      ctx.stroke();
+    }
+
+    const drawHand = (deg, len, width, alpha=1) => {
+      const a = deg2rad(deg - 90);
+      ctx.beginPath();
+      ctx.lineCap = "round";
+      ctx.lineWidth = width;
+      ctx.strokeStyle = `rgba(255,255,255,${alpha})`;
+      ctx.moveTo(0, 0);
+      ctx.lineTo(Math.cos(a) * len, Math.sin(a) * len);
+      ctx.stroke();
+    };
+
+    drawHand(angles.thetaSec,  R * 0.92, R * 0.006, 0.35);
+    drawHand(angles.thetaMin,  R * 0.82, R * 0.020, 0.90);
+    drawHand(angles.thetaHour, R * 0.58, R * 0.030, 0.95);
+
+    // center cap
+    ctx.beginPath();
+    ctx.arc(0, 0, R * 0.04, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.fill();
+
+    // If we're in mirror (non-digital-only), draw the 12–6 axis line for flavor
+    if (document.body.classList.contains("invert") && !document.body.classList.contains("digital-only")) {
+      const axisDeg = 0;
+      const a = deg2rad(axisDeg - 90);
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a) * (-R * 1.02), Math.sin(a) * (-R * 1.02));
+      ctx.lineTo(Math.cos(a) * ( R * 1.02), Math.sin(a) * ( R * 1.02));
+      ctx.lineWidth = R * 0.010;
+      ctx.strokeStyle = "rgba(255,255,255,0.28)";
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  };
+
+  // =========================
+  // Countdown formatting
+  // =========================
+  function fmtCountdown(sec) {
+    sec = Math.max(0, sec);
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${fmt2(m)}:${fmt2(s)}`;
+  }
+
+  function typeLabel(t) {
+    if (t === "hard") return "hard";
+    if (t === "digital") return "digit";
+    if (t === "soft_axis_v") return "soft";
+    return "—";
+  }
+
+  // =========================
+  // Loop
+  // =========================
+  function update() {
+    const now = new Date();
+    const angles = handAngles(now);
+    const state = evaluateNow(now, angles);
+
+    // HUD time
+    elDigitalNow.textContent = fmtTime(now);
+
+    // Countdown to next event (hard/soft/digital)
+    const nowSec = secondsOfDay(now);
+    const next = findNextEvent(nowSec);
+    elCountdown.textContent = fmtCountdown(next.deltaSec);
+    elNextType.textContent = typeLabel(next.ev.type);
+
+    // Invert on any mirror time (hard, soft window, digital minute)
+    document.body.classList.toggle("invert", state.mirror);
+
+    // Digital-only mode on DIGITAL mirror times
+    const digitalOnly = state.showDigitalOnly && state.kind === "digital";
+    document.body.classList.toggle("digital-only", digitalOnly);
+
+    // digits shown in digital-only mode
+    if (digitalOnly) {
+      const hh = fmt2(now.getHours());
+      const mm = fmt2(now.getMinutes());
+      elMirrorDigits.textContent = `${hh}:${mm}`;
+      elMirrorSub.textContent = "digitális tüköridő";
+      document.body.classList.add("digital-only");
+    } else {
+      document.body.classList.remove("digital-only");
+    }
+
+    // Draw analog clock (if not digital-only)
+    if (!digitalOnly) drawClock(angles);
+
+    requestAnimationFrame(update);
+  }
+
+  update();
+})();
+</script>
+</body>
+</html>
